@@ -1,0 +1,13 @@
+# DouyinViet - Dependencies
+# Cài tất cả: pip install -r requirements.txt
+
+openai-whisper      # Nhận dạng giọng nói tiếng Trung (offline, free)
+deep-translator     # Dịch Google Translate (free, không cần API key)
+tqdm                # Thanh tiến trình
+yt-dlp              # Tải video Douyin/TikTok/YouTube...
+torch               # PyTorch (cần cho Whisper) - tự cài với whisper
+
+# ffmpeg cài riêng qua hệ điều hành:
+#   Ubuntu/Debian: sudo apt install ffmpeg
+#   macOS:         brew install ffmpeg
+#   Windows:       https://ffmpeg.org/download.html  (thêm vào PATH)
