@@ -719,8 +719,8 @@ class DouyinWorker:
         Yêu cầu: vid_path phải tồn tại và có file SRT tương ứng
         (<stem>_vi.srt) trong cùng out_dir — tức Phase 1 đã chạy xong.
         """
-        vid = _Path(vid_path).resolve()
-        out_dir = _Path(out_dir)
+        vid = Path(vid_path).resolve()
+        out_dir = Path(out_dir)
  
         if not vid.exists():
             self.log(f"❌ Không tìm thấy file video: {vid.name}", ERR)

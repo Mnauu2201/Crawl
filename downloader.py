@@ -58,9 +58,41 @@ def cookies_for_ytdlp(cookies_file):
     return str(cookies_file)
 
 
+# Các lỗi TẠM THỜI của yt-dlp — thường do TikTok/nguồn soft rate-limit
+# hoặc lag mạng, KHÔNG phải do video có vấn đề thật (private/xoá/hết hạn).
+# Bằng chứng: cùng 1 video, lần chạy này lỗi rehydration, lần khác lại
+# tải được bình thường — nên retry sau vài giây thường sẽ qua.
+_TRANSIENT_ERROR_MARKERS = (
+    "rehydration",       # TikTok trả HTML rút gọn, thiếu __UNIVERSAL_DATA__
+    "unable to extract", # parse trang thất bại nói chung, hay do rate-limit
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "temporary failure",
+    "http error 429",    # too many requests
+    "http error 503",    # service unavailable
+)
+
+
+def _is_transient_error(err_text):
+    t = (err_text or "").lower()
+    return any(marker in t for marker in _TRANSIENT_ERROR_MARKERS)
+
+
 # ── Tải 1 video ─────────────────────────────────────────────────────
-def download_one(url, title, out_dir, cookies_file=None, extra_args=None):
-    """Tải 1 video bằng yt-dlp. Trả về (ok: bool, path_hoặc_loi: str)."""
+def download_one(url, title, out_dir, cookies_file=None, extra_args=None,
+                  max_retries=3, retry_delay=4):
+    """Tải 1 video bằng yt-dlp. Trả về (ok: bool, path_hoặc_loi: str).
+
+    Fix 'lỗi rehydration ngẫu nhiên khiến video bị coi thất bại vĩnh viễn'
+    (2026-07-16): trước đây chỉ gọi yt-dlp đúng 1 lần — nếu dính lỗi tạm
+    thời (TikTok soft rate-limit trả HTML rút gọn, timeout mạng...) thì
+    coi là thất bại luôn, dù thử lại ngay sau vài giây thường sẽ qua (đã
+    quan sát: cùng video lúc lỗi lúc không giữa 2 lần crawl). Giờ tự
+    retry tối đa `max_retries` lần với backoff tăng dần, NHƯNG chỉ với
+    lỗi khớp _TRANSIENT_ERROR_MARKERS — lỗi khác (video private, đã xoá,
+    sai định dạng...) trả về ngay lần đầu, retry thêm cũng vô ích."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     safe = sanitize_filename(title, fallback="video")
@@ -77,10 +109,24 @@ def download_one(url, title, out_dir, cookies_file=None, extra_args=None):
     if extra_args:
         cmd += extra_args
 
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode == 0:
-        return True, str(out_path)
-    return False, (r.stderr or "")[-200:]
+    last_err = "Lỗi không rõ"
+    for attempt in range(1, max_retries + 1):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            return True, str(out_path)
+
+        last_err = (r.stderr or "")[-200:]
+        if attempt < max_retries and _is_transient_error(last_err):
+            # Backoff tăng dần (4s, 8s, 12s...) — giãn cách đủ để qua
+            # được soft rate-limit, không cần random vì mỗi video đã
+            # chạy trên luồng riêng (ThreadPoolExecutor), tự nhiên lệch
+            # thời điểm nhau rồi.
+            time.sleep(retry_delay * attempt)
+            continue
+        # Lỗi không thuộc dạng tạm thời, hoặc đã hết lượt retry.
+        break
+
+    return False, last_err
 
 
 # ── Tải hàng loạt: concurrency + registry + stop graceful ────────────
@@ -146,7 +192,8 @@ def download_batch(items, out_dir, id_fn, cookies_file=None, registry=None,
                 if registry:
                     registry.add(iid)
             else:
-                log(f"  ❌ [{done_count}/{n}] {title} — {info}", ERR)
+                log(f"  ❌ [{done_count}/{n}] {title} — {info} "
+                    f"(đã thử lại vẫn lỗi)", ERR)
             progress(done_count / n, f"Tải {done_count}/{n}...")
     finally:
         # wait=False + cancel_futures: nếu người dùng bấm Dừng, các tác

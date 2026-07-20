@@ -30,15 +30,28 @@ _VOICE_KEY    = {"Giọng nữ (HoaiMy)": "nu", "Giọng nam (NamMinh)": "nam"}
 # không khớp vị trí thật trong video_FINAL.mp4.
 # Giải pháp: cố định CHIỀU RỘNG khung, để CHIỀU CAO tự tính theo đúng
 # aspect ratio video đang xử lý (mặc định 9:16 khi chưa có video thật).
-_PREV_BOX_W = 220      # độ rộng tối đa khung preview, không đổi
-_PREV_BOX_H_MAX = 391  # chiều cao tối đa cho phép (giới hạn UI)
+#
+# Fix 2026-07-15: 220px quá nhỏ để đọc được chữ Trung/vị trí sub khi
+# chưa mở fullscreen — người dùng phải mở rộng mới canh được vùng
+# blur/sub, mất tác dụng của preview inline. Tăng lên 420px (gần gấp
+# đôi) — vẫn đủ nhỏ để nằm gọn trong cột trái cạnh danh sách URL, không
+# đụng panel cài đặt bên phải (xem _dy_resize_canvas cho phần co giãn
+# thêm theo độ rộng cửa sổ thật).
+_PREV_BOX_W = 420      # độ rộng MẶC ĐỊNH khung preview (trước: 220)
+_PREV_BOX_W_MIN = 260  # không co nhỏ hơn mức này dù cửa sổ hẹp
+_PREV_BOX_W_MAX = 560  # không phình to hơn mức này dù cửa sổ rất rộng
+_PREV_BOX_H_MAX = 760  # chiều cao tối đa cho phép (giới hạn UI, trước: 391)
 
-def _prev_dims(video_w, video_h):
+def _prev_dims(video_w, video_h, box_w=None):
     """Tính (canvas_w, canvas_h) sao cho khớp đúng aspect ratio video,
-    không vượt quá _PREV_BOX_W × _PREV_BOX_H_MAX."""
+    không vượt quá box_w (mặc định _PREV_BOX_W) × _PREV_BOX_H_MAX.
+    box_w cho phép truyền độ rộng động (theo cửa sổ thật) — xem
+    _dy_on_resize."""
+    if box_w is None:
+        box_w = _PREV_BOX_W
     video_w = max(1, video_w); video_h = max(1, video_h)
     ar = video_w / video_h
-    w = _PREV_BOX_W
+    w = box_w
     h = int(round(w / ar))
     if h > _PREV_BOX_H_MAX:
         h = _PREV_BOX_H_MAX
@@ -118,6 +131,13 @@ class App(ctk.CTk):
         self._player_total    = 0      # total frame count
         self._player_pos      = 0      # current frame index
         self._player_thread   = None
+        self._player_lock     = threading.Lock()  # bảo vệ _player_cap khỏi
+        # race condition: player_loop (thread nền) và scrub/toggle/fullscreen
+        # (GUI thread) trước đây cùng gọi .set()/.read() trên 1 VideoCapture
+        # không thread-safe cùng lúc → giật/lag khi click nút play hoặc mở
+        # rộng preview trong lúc đang phát.
+        self._fs_win           = None  # Toplevel fullscreen đang mở (nếu có)
+        self._player_video_path = None  # path video đang load trong player
         self._fb_videos = []; self._fb_vars = {}; self._fb_worker = None
         self._tt_videos = []; self._tt_vars = {}; self._tt_worker = None
         # Preview state
@@ -125,6 +145,8 @@ class App(ctk.CTk):
         self._preview_photo_ref = None    # PhotoImage ref (chống GC)
         self._preview_video_w = 1920
         self._preview_video_h = 1080
+        self._prev_box_w = _PREV_BOX_W  # độ rộng khung preview hiện tại,
+        # cập nhật động theo độ rộng cửa sổ thật qua _dy_on_resize
         self._build()
 
     # ── Header ───────────────────────────────────────────────────
@@ -247,13 +269,21 @@ class App(ctk.CTk):
         # Canvas khởi tạo với tỉ lệ dọc mặc định 9:16 — đúng aspect ratio
         # thật của Douyin/TikTok thay vì 16:9 ngang sai trước đây. Sẽ
         # resize động (_dy_resize_canvas) khi load được frame thật.
-        _init_w, _init_h = _prev_dims(self._preview_video_w, self._preview_video_h)
+        _init_w, _init_h = _prev_dims(self._preview_video_w, self._preview_video_h, self._prev_box_w)
         self.dy_canvas = tk.Canvas(prev_wrap, bg="#0f0f13",
                                     width=_init_w, height=_init_h,
                                     highlightthickness=1,
                                     highlightbackground="#333355")
         self.dy_canvas.grid(row=1, column=0, padx=6, pady=(0, 2))
         self._dy_draw_preview()  # vẽ placeholder
+
+        # Co giãn khung preview theo độ rộng cửa sổ thật (trong khoảng
+        # _PREV_BOX_W_MIN..MAX) — trước đây cố định 220px luôn, quá nhỏ
+        # để đọc chữ Trung/canh vùng blur khi chưa mở fullscreen. Bind
+        # trên prev_wrap (không phải canvas) vì canvas tự thay đổi kích
+        # thước theo _prev_box_w, bind lên chính nó sẽ gây vòng lặp.
+        self._prev_last_resize_w = None
+        prev_wrap.bind("<Configure>", self._dy_on_prev_wrap_resize)
 
         # ── Player controls (row 2) — hiện sau khi có video ───────
         # Canvas đóng vai trò màn hình player — không dùng widget riêng,
@@ -901,18 +931,151 @@ class App(ctk.CTk):
                                from_=0, to_=100, unit="%")
 
     # ── Preview canvas helpers ─────────────────────────────────
+    def _dy_on_prev_wrap_resize(self, event):
+        """Bắt sự kiện Configure của prev_wrap (chạy khi cửa sổ đổi kích
+        thước) để co giãn khung preview theo không gian thật. Trước đây
+        khung cố định 220px — quá nhỏ để đọc chữ Trung/canh vùng blur khi
+        chưa mở fullscreen (2026-07-15)."""
+        # event.width là độ rộng của prev_wrap; trừ padding 2 bên (mỗi
+        # bên ~6-8px như đang dùng ở canvas.grid) để không tràn khung.
+        new_w = max(_PREV_BOX_W_MIN, min(_PREV_BOX_W_MAX, event.width - 20))
+        # Chỉ redraw khi thay đổi đủ lớn (>8px) — tránh vẽ lại liên tục
+        # với từng sự kiện Configure nhỏ lẻ (kéo cửa sổ tạo rất nhiều
+        # sự kiện liên tiếp), giữ UI mượt khi resize.
+        if (self._prev_last_resize_w is not None
+                and abs(new_w - self._prev_last_resize_w) < 8):
+            return
+        self._prev_last_resize_w = new_w
+        self._prev_box_w = new_w
+        pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h, new_w)
+        self.dy_canvas.configure(width=pw, height=ph)
+        # Nếu đang có video/frame thật đã load, decode lại theo kích
+        # thước mới trên thread nền (không đồng bộ) — kéo cửa sổ liên
+        # tục có thể bắn nhiều sự kiện Configure dồn dập, decode đồng bộ
+        # ngay trên GUI thread ở đây dễ lặp lại đúng lỗi "No Response"
+        # đã fix trước đó.
+        if self._player_cap is not None:
+            self._resize_req_seq = getattr(self, "_resize_req_seq", 0) + 1
+            req_id = self._resize_req_seq
+            frame_idx = self._player_pos
+
+            def _bg():
+                result = self._dy_decode_frame(frame_idx, pw, ph, seek=True)
+                if result is None or req_id != self._resize_req_seq:
+                    return
+                idx, img = result
+                self.after(0, self._dy_apply_decoded_frame, idx, img)
+            threading.Thread(target=_bg, daemon=True).start()
+        else:
+            self._dy_draw_preview()
+
+    def _dy_overlay_layer(self, pw, ph):
+        """Tạo layer RGBA (cam=blur, xanh=sub) theo đúng kích thước
+        (pw, ph) hiện tại — TÁCH RIÊNG khỏi _dy_draw_preview để dùng
+        chung được cho cả frame tĩnh (pause) LẪN frame đang phát.
+
+        Fix 'chớp chớp khi bật blur+sub' (2026-07-15): trước đây overlay
+        chỉ được vẽ trong _dy_draw_preview, còn lúc video đang PHÁT thì
+        _dy_apply_decoded_frame/_dy_player_show_frame vẽ thẳng frame gốc
+        KHÔNG có overlay lên canvas ở tốc độ ~30fps. Hai đường vẽ giành
+        nhau cùng 1 canvas → overlay xuất hiện rồi bị frame sạch xoá
+        liên tục, nhìn như chớp và không định vị được vùng blur/sub.
+        Giải pháp: mọi nơi vẽ frame lên canvas đều phải composite qua
+        hàm này trước khi hiển thị, kể cả trong lúc phát.
+
+        Fix lag/giật khi phát+fullscreen (2026-07-15 lần 2): vẽ overlay
+        bằng PIL ImageDraw (rectangle+text) TỐN CPU đáng kể nếu tính lại
+        mỗi frame ở ~30fps trong lúc phát — trong khi giá trị blur/sub
+        hầu như KHÔNG đổi giữa các frame liên tiếp (chỉ đổi khi người
+        dùng kéo slider). Cache kết quả theo key gồm mọi tham số ảnh
+        hưởng tới hình dạng overlay; chỉ vẽ lại khi key đổi."""
+        key = (
+            pw, ph,
+            self.dy_blur.get(), round(self.dy_blur_top.get(), 1), round(self.dy_blur_bot.get(), 1),
+            self.dy_burn.get(), round(self.dy_margin_v.get(), 1), round(self.dy_font_size.get(), 1),
+            self._preview_video_h,
+        )
+        cache = getattr(self, "_overlay_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+
+        from PIL import Image, ImageDraw
+        ov = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+        if not hasattr(self, 'dy_blur'):
+            return ov
+        d = ImageDraw.Draw(ov)
+
+        # ── Overlay blur zone (cam) ───────────────────────────
+        if self.dy_blur.get():
+            tp = max(0.0, min(0.99, self.dy_blur_top.get() / 100))
+            bp = max(tp + 0.005, min(1.0, self.dy_blur_bot.get() / 100))
+            y1 = int(ph * tp)
+            y2 = int(ph * bp)
+            d.rectangle([0, y1, pw, y2], fill=(255, 140, 0, 90))
+            d.rectangle([0, y1, pw - 1, y2 - 1],
+                        outline=(255, 160, 30, 220), width=2)
+            d.rectangle([2, y1 + 2, 2 + 140, y1 + 14], fill=(0, 0, 0, 140))
+            d.text((4, y1 + 3),
+                   f"Blur: {int(round(self.dy_blur_top.get()))}% → {int(round(self.dy_blur_bot.get()))}%",
+                   fill=(255, 200, 60, 255))
+
+        # ── Overlay sub position (xanh lá) ───────────────────
+        if self.dy_burn.get():
+            mv = max(0, self.dy_margin_v.get())
+            fs = max(8, self.dy_font_size.get())
+            vid_h = max(1, self._preview_video_h)
+            scale = ph / vid_h
+            mv_scaled = max(2, round(mv * scale))
+            fs_scaled = max(6, round(fs * scale * 1.1))
+            y_bot = ph - mv_scaled
+            y_top = max(0, y_bot - fs_scaled)
+            d.rectangle([10, y_top, pw - 10, y_bot], fill=(0, 200, 60, 70))
+            d.rectangle([10, y_top, pw - 11, y_bot - 1],
+                        outline=(50, 230, 80, 220), width=1)
+            lbl = f"MarginV={mv:.0f}px Size={fs:.0f}px"
+            lbl_w = min(pw - 20, len(lbl) * 5 + 4)
+            d.rectangle([10, y_top + 1, 10 + lbl_w, y_top + 13], fill=(0, 0, 0, 140))
+            d.text((12, y_top + 2), lbl, fill=(100, 255, 120, 255))
+        self._overlay_cache = (key, ov)
+        return ov
+
     def _dy_draw_preview(self):
-        """Vẽ lại overlay lên canvas preview (chạy trên GUI thread)."""
+        """Vẽ lại overlay lên canvas preview (chạy trên GUI thread).
+
+        Fix 'preview nhảy về thumbnail khi kéo blur/sub' (2026-07-15):
+        hàm này trước đây LUÔN vẽ từ self._preview_pil_orig (ảnh tĩnh lấy
+        1 lần lúc đầu, ví dụ frame đầu video) — khi player đã load video
+        và người dùng đang xem/dừng ở 1 frame khác rồi kéo slider blur/
+        sub, preview bị vẽ đè về ảnh tĩnh đó thay vì frame đang xem, gây
+        cảm giác "nhảy về thumbnail" và không canh được đúng điểm. Giờ
+        nếu player đã có video (_player_cap tồn tại), việc kéo slider sẽ
+        vẽ lại đúng FRAME HIỆN TẠI của player (_player_pos) kèm overlay,
+        không đụng tới _preview_pil_orig nữa."""
         # Guard: các vars này được khai báo ở phần dưới _build_douyin,
         # nhưng hàm này được gọi sớm hơn (lúc vẽ placeholder canvas).
         if not hasattr(self, 'dy_blur'):
+            return
+
+        if self._player_cap is not None:
+            # Player đã load video — vẽ lại frame hiện tại (không seek,
+            # không đổi vị trí phát) thay vì ảnh thumbnail tĩnh.
+            if self._player_running and not self._player_paused:
+                # Đang PHÁT: không tự seek ở đây — _dy_player_loop (thread
+                # nền) đang liên tục .read() trên cùng _player_cap; gọi
+                # thêm .set() đồng bộ trên GUI thread ở đây sẽ tranh chấp
+                # VideoCapture với thread đó → giật/lag (đặc biệt rõ khi
+                # mở fullscreen). Cứ để player_loop tự vẽ overlay mới ở
+                # frame kế tiếp (nó cũng dùng _dy_overlay_layer, luôn đọc
+                # giá trị slider mới nhất).
+                return
+            self._dy_player_show_frame(self._player_pos)
             return
 
         # Kích thước khung TÍNH THEO ĐÚNG TỈ LỆ video thật — khử méo
         # hình hoàn toàn so với canvas cố định 16:9 trước đây (vốn ép
         # video dọc 9:16 của Douyin vào khung ngang, làm sai lệch mọi %
         # và mọi quy đổi px→preview).
-        pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h)
+        pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h, self._prev_box_w)
         # Resize canvas widget nếu tỉ lệ video vừa đổi (lần đầu load frame
         # thật, hoặc đổi sang video khác có tỉ lệ khác)
         if (self.dy_canvas.winfo_reqwidth(), self.dy_canvas.winfo_reqheight()) != (pw, ph):
@@ -944,50 +1107,7 @@ class App(ctk.CTk):
                    "Dán link rồi bấm 📁 Tải frame\nhoặc chờ tải xong để xem preview",
                    fill=(90, 90, 130, 255))
 
-        ov = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
-        d = ImageDraw.Draw(ov)
-
-        # ── Overlay blur zone (cam) ───────────────────────────
-        if self.dy_blur.get():
-            tp = max(0.0, min(0.99, self.dy_blur_top.get() / 100))
-            bp = max(tp + 0.005, min(1.0, self.dy_blur_bot.get() / 100))
-            y1 = int(ph * tp)
-            y2 = int(ph * bp)
-            # Vùng mờ: cam bán trong suốt
-            d.rectangle([0, y1, pw, y2], fill=(255, 140, 0, 90))
-            d.rectangle([0, y1, pw - 1, y2 - 1],
-                        outline=(255, 160, 30, 220), width=2)
-            # Label
-            d.rectangle([2, y1 + 2, 2 + 140, y1 + 14], fill=(0, 0, 0, 140))
-            d.text((4, y1 + 3),
-                   f"Blur: {int(round(self.dy_blur_top.get()))}% → {int(round(self.dy_blur_bot.get()))}%",
-                   fill=(255, 200, 60, 255))
-
-        # ── Overlay sub position (xanh lá) ───────────────────
-        if self.dy_burn.get():
-            mv = max(0, self.dy_margin_v.get())
-            fs = max(8, self.dy_font_size.get())
-            # Scale theo CHIỀU CAO VIDEO THẬT (không phải canvas cố
-            # định) — libass tính FontSize/MarginV theo pixel của
-            # video gốc khi burn bằng subtitles filter, nên preview
-            # phải dùng đúng cùng cơ sở quy đổi mới khớp video_FINAL.
-            vid_h = max(1, self._preview_video_h)
-            scale = ph / vid_h
-            mv_scaled = max(2, round(mv * scale))
-            # Chiều cao 1 dòng text trong libass (BorderStyle=1) xấp xỉ
-            # FontSize × 1.1 (line height thực đo, không phải số đoán
-            # mò 1.4 trước đây — đó là nguồn lệch chính giữa preview và
-            # video_FINAL.mp4 khi font lớn hoặc video tỉ lệ dọc).
-            fs_scaled = max(6, round(fs * scale * 1.1))
-            y_bot = ph - mv_scaled
-            y_top = max(0, y_bot - fs_scaled)
-            d.rectangle([10, y_top, pw - 10, y_bot], fill=(0, 200, 60, 70))
-            d.rectangle([10, y_top, pw - 11, y_bot - 1],
-                        outline=(50, 230, 80, 220), width=1)
-            lbl = f"MarginV={mv:.0f}px Size={fs:.0f}px"
-            lbl_w = min(pw - 20, len(lbl) * 5 + 4)
-            d.rectangle([10, y_top + 1, 10 + lbl_w, y_top + 13], fill=(0, 0, 0, 140))
-            d.text((12, y_top + 2), lbl, fill=(100, 255, 120, 255))
+        ov = self._dy_overlay_layer(pw, ph)
 
         # ── Composite và hiển thị ─────────────────────────────
         final = Image.alpha_composite(bg, ov).convert("RGB")
@@ -1250,21 +1370,38 @@ class App(ctk.CTk):
             step=lambda i: self.after(0, self._dy_step_fn, i),
         )
         self._dy_worker = w
-        threading.Thread(target=w.run_postprocess_only, daemon=True, kwargs=dict(
-            vid_path=vid,
-            out_dir=out_dir,
-            model=self.dy_model.get(),
-            use_groq=self.dy_use_groq.get(),
-            do_blur=self.dy_blur.get(),
-            do_tts=self.dy_tts.get(),
-            do_burn=self.dy_burn.get(),
-            voice=_VOICE_KEY.get(self.dy_voice.get(), "nu"),
-            orig_vol=float(self.dy_orig_vol.get() or "0.15"),
-            blur_top_pct=self.dy_blur_top.get() / 100,
-            blur_bot_pct=self.dy_blur_bot.get() / 100,
-            margin_v=int(max(0, self.dy_margin_v.get())),
-            font_size=int(max(8, self.dy_font_size.get())),
-        )).start()
+
+        def _run_postprocess_safe():
+            """Wrap run_postprocess_only bằng try/except — nếu code trong
+            douyin_worker.py raise exception ngay từ đầu (import lỗi, key
+            kwargs sai, file không tồn tại...), thread nền chết ÂM THẦM và
+            UI đứng mãi ở 'Đang áp dụng hậu kỳ...' không có log gì, không
+            cách nào biết nguyên nhân. Bắt exception ở đây để LUÔN in ra
+            log và gọi done() (mở lại nút bấm) dù lỗi gì xảy ra."""
+            try:
+                w.run_postprocess_only(
+                    vid_path=vid,
+                    out_dir=out_dir,
+                    model=self.dy_model.get(),
+                    use_groq=self.dy_use_groq.get(),
+                    do_blur=self.dy_blur.get(),
+                    do_tts=self.dy_tts.get(),
+                    do_burn=self.dy_burn.get(),
+                    voice=_VOICE_KEY.get(self.dy_voice.get(), "nu"),
+                    orig_vol=float(self.dy_orig_vol.get() or "0.15"),
+                    blur_top_pct=self.dy_blur_top.get() / 100,
+                    blur_bot_pct=self.dy_blur_bot.get() / 100,
+                    margin_v=int(max(0, self.dy_margin_v.get())),
+                    font_size=int(max(8, self.dy_font_size.get())),
+                )
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                self.after(0, self._dy_log_fn,
+                           f"❌ LỖI khi áp dụng hậu kỳ: {e}\n{tb}", "error")
+                self.after(0, self._dy_done)
+
+        threading.Thread(target=_run_postprocess_safe, daemon=True).start()
 
     def _dy_stop(self):
         if self._dy_worker: self._dy_worker.stop()
@@ -1322,11 +1459,14 @@ class App(ctk.CTk):
                 self._player_pos          = 0
                 self._player_paused       = True
                 self._player_running      = True
-                # Re-open capture on GUI side (thread-safe: only one thread
-                # touches self._player_cap at a time after this point)
-                if self._player_cap:
-                    self._player_cap.release()
-                self._player_cap = cv2.VideoCapture(str(video_path))
+                # Re-open capture on GUI side, dưới lock để không đụng
+                # thread nào khác đang seek/read trên _player_cap
+                new_cap = cv2.VideoCapture(str(video_path))
+                with self._player_lock:
+                    if self._player_cap:
+                        self._player_cap.release()
+                    self._player_cap = new_cap
+                self._player_video_path = video_path
                 self.dy_play_pause_btn.configure(state="normal", text="▶")
                 self.dy_scrub.configure(state="normal")
                 self._player_pos_var.set(0.0)
@@ -1357,17 +1497,24 @@ class App(ctk.CTk):
                 "pip install opencv-python\nđể dùng player nhúng trong tool.")
             return
 
-        # Dừng player đang chạy nếu có
+        # Dừng player đang chạy nếu có (join để chắc chắn thread cũ đã
+        # thoát trước khi chạm vào cap, tránh 2 thread cùng đọc 1 cap đã
+        # release ở dưới)
         self._player_running = False
-        if self._player_cap:
-            self._player_cap.release()
+        self._player_paused  = True
+        if self._player_thread and self._player_thread.is_alive():
+            self._player_thread.join(timeout=1.0)
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             self._dy_preview_status("⚠ Không mở được video trong player")
             return
 
-        self._player_cap     = cap
+        with self._player_lock:
+            if self._player_cap:
+                self._player_cap.release()
+            self._player_cap = cap
+        self._player_video_path = video_path
         self._player_fps     = cap.get(cv2.CAP_PROP_FPS) or 30.0
         self._player_total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._player_pos     = 0
@@ -1388,28 +1535,70 @@ class App(ctk.CTk):
         # Hiện frame đầu tiên làm thumbnail
         self._dy_player_show_frame(0)
 
+    def _dy_decode_frame(self, frame_idx, target_w, target_h, seek=True):
+        """Decode + resize 1 frame — hàm THUẦN TÍNH TOÁN, PHẢI chạy trên
+        thread nền, không bao giờ gọi trực tiếp từ GUI thread. Trả về
+        (frame_idx, PIL.Image) hoặc None nếu lỗi.
+
+        Đây là fix chính cho "No Response" 2026-07-15: bản cũ gọi
+        cap.set()+cap.read()+cv2.cvtColor+PIL resize(LANCZOS) bên TRONG
+        self.after() callback — tức là chạy thẳng trên GUI/event thread
+        của Tkinter. Fix: decode+resize chạy hết trên thread nền, GUI
+        thread chỉ nhận ảnh đã dựng xong để vẽ (việc rẻ, không block).
+
+        seek=True (mặc định): gọi cap.set(CAP_PROP_POS_FRAMES) trước khi
+        đọc — dùng cho nhảy cóc (scrub, mở fullscreen, load lần đầu).
+        seek=False: bỏ qua .set(), chỉ .read() — VideoCapture tự động
+        đọc frame KẾ TIẾP theo con trỏ nội bộ sau lần .read() trước, nên
+        khi phát tuần tự không cần seek lại mỗi frame.
+
+        Fix giật video 2026-07-15 (lần 3): gọi .set() ngay cả khi
+        frame_idx là "frame kế tiếp" (phát bình thường) vẫn ép decoder
+        seek lại từ keyframe gần nhất trên codec nén (H.264...) — cực kỳ
+        lãng phí, khiến tốc độ decode không đuổi kịp FPS thật → giật dù
+        GUI thread không còn bị block. .set() giờ chỉ gọi khi seek=True."""
+        import cv2
+        from PIL import Image
+        with self._player_lock:
+            if not self._player_cap:
+                return None
+            if seek:
+                self._player_cap.set(1, frame_idx)  # CAP_PROP_POS_FRAMES
+            ret, frame = self._player_cap.read()
+        if not ret:
+            return None
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb).resize((target_w, target_h), Image.BILINEAR)
+        return (frame_idx, img)
+
+
     def _dy_player_show_frame(self, frame_idx):
-        """Seek tới frame_idx, decode và hiện lên canvas."""
+        """Seek tới frame_idx và hiện lên canvas. An toàn gọi trực tiếp từ
+        GUI thread (scrub, click) — decode chạy đồng bộ ở đây vì đây là
+        thao tác 1-lần, không phải vòng lặp phát liên tục (khác với
+        _dy_player_loop, xem hàm đó để biết cách chạy khi đang phát)."""
         if not self._player_cap:
             return
         try:
-            from PIL import Image, ImageTk
+            from PIL import ImageTk
         except ImportError:
             return
 
-        self._player_cap.set(1, frame_idx)  # CAP_PROP_POS_FRAMES
-        ret, frame = self._player_cap.read()
-        if not ret:
+        pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h, self._prev_box_w)
+        result = self._dy_decode_frame(frame_idx, pw, ph)
+        if result is None:
             return
+        _, img = result
 
-        import cv2
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h)
         if (self.dy_canvas.winfo_reqwidth(), self.dy_canvas.winfo_reqheight()) != (pw, ph):
             self.dy_canvas.configure(width=pw, height=ph)
 
-        img = Image.fromarray(frame_rgb).resize((pw, ph), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
+        # Composite overlay blur/sub lên frame — cùng đường vẽ với
+        # preview tĩnh, tránh lệch/chớp khi seek trong lúc pause.
+        from PIL import Image
+        ov = self._dy_overlay_layer(pw, ph)
+        final = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+        photo = ImageTk.PhotoImage(final)
         self.dy_canvas.delete("all")
         self.dy_canvas.create_image(0, 0, anchor="nw", image=photo)
         self._preview_photo_ref = photo
@@ -1423,9 +1612,50 @@ class App(ctk.CTk):
         self.dy_time_lbl.configure(
             text=f"{cur_s//60}:{cur_s%60:02d}/{tot_s//60}:{tot_s%60:02d}")
 
+    def _dy_apply_decoded_frame(self, frame_idx, img):
+        """Nhận ảnh ĐÃ decode+resize xong từ thread nền và vẽ lên canvas.
+        Chỉ làm việc nhẹ (tạo PhotoImage + vẽ) — an toàn chạy trên GUI
+        thread qua self.after(), không bao giờ block đáng kể."""
+        try:
+            from PIL import ImageTk
+        except ImportError:
+            return
+        if not self._player_running or self._player_cap is None:
+            return
+        pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h, self._prev_box_w)
+        if (self.dy_canvas.winfo_reqwidth(), self.dy_canvas.winfo_reqheight()) != (pw, ph):
+            self.dy_canvas.configure(width=pw, height=ph)
+        # Composite overlay blur/sub lên MỖI frame đang phát — đây là fix
+        # chính cho lỗi "chớp chớp, không thấy overlay khi bật blur+sub":
+        # trước đây hàm này vẽ img gốc không overlay ở ~30fps, xoá mất
+        # overlay do _dy_draw_preview vẽ trước đó. Giờ dùng chung
+        # _dy_overlay_layer() với preview tĩnh nên overlay LUÔN hiện,
+        # kể cả khi video đang chạy.
+        from PIL import Image
+        ov = self._dy_overlay_layer(pw, ph)
+        final = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+        photo = ImageTk.PhotoImage(final)
+        self.dy_canvas.delete("all")
+        self.dy_canvas.create_image(0, 0, anchor="nw", image=photo)
+        self._preview_photo_ref = photo
+
+        self._player_pos = frame_idx
+        frac = frame_idx / max(1, self._player_total - 1)
+        self._player_pos_var.set(frac)
+        cur_s = int(frame_idx / self._player_fps)
+        tot_s = int(self._player_total / self._player_fps)
+        self.dy_time_lbl.configure(
+            text=f"{cur_s//60}:{cur_s%60:02d}/{tot_s//60}:{tot_s%60:02d}")
+
     def _dy_toggle_play(self):
         """Play/Pause toggle. Khởi động vòng lặp phát trên thread riêng."""
         if not self._player_cap:
+            return
+        if self._fs_win is not None and self._fs_win.winfo_exists():
+            # Fullscreen đang mở và đang có loop riêng của nó — không cho
+            # player nhúng ở màn chính chạy song song (nguồn giật cũ).
+            self._fs_win.lift()
+            self._fs_win.focus_force()
             return
         if self._player_paused:
             self._player_paused = False
@@ -1439,36 +1669,84 @@ class App(ctk.CTk):
             self.dy_play_pause_btn.configure(text="▶")
 
     def _dy_player_loop(self):
-        """Vòng lặp phát trên thread riêng — decode frame theo FPS, đẩy
-        lên GUI thread qua self.after(). Dừng khi paused hoặc hết video."""
+        """Vòng lặp phát trên thread NỀN. Decode + resize (việc NẶNG)
+        chạy hoàn toàn ở đây, ngoài GUI thread. Chỉ đẩy ảnh đã xong lên
+        GUI thread qua self.after() để vẽ (việc NHẸ).
+
+        Fix giật video 2026-07-15 (lần 3): dùng seek=False — con trỏ đọc
+        nội bộ của cv2.VideoCapture tự động trỏ tới frame kế tiếp sau mỗi
+        .read(), nên chỉ cần .read() liên tục là đủ, không cần .set() lại
+        mỗi lần (ép decode lại từ keyframe, rất chậm trên codec nén →
+        đây là nguyên nhân giật). Dùng biến `pos` CỤC BỘ tự tăng trong
+        vòng lặp (không đọc lại self._player_pos mỗi vòng) vì
+        self._player_pos chỉ được cập nhật TRỄ trên GUI thread qua
+        .after() — đọc lại nó ngay ở thread nền có thể thấy giá trị cũ
+        và vô tình phát lại/bỏ frame."""
         import time as _time
+        pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h, self._prev_box_w)
         frame_ms = 1.0 / self._player_fps
+        pos = self._player_pos
         while self._player_running and not self._player_paused:
             t0 = _time.perf_counter()
-            pos = self._player_pos + 1
+            pos += 1
             if pos >= self._player_total:
                 # Hết video — pause và quay về frame cuối
                 self._player_paused = True
                 self.after(0, lambda: self.dy_play_pause_btn.configure(text="▶"))
                 break
-            self.after(0, self._dy_player_show_frame, pos)
+            result = self._dy_decode_frame(pos, pw, ph, seek=False)
+            if result is not None:
+                idx, img = result
+                self.after(0, self._dy_apply_decoded_frame, idx, img)
             elapsed = _time.perf_counter() - t0
             sleep = frame_ms - elapsed
+            # Nếu decode 1 frame đã lâu hơn frame_ms (thường xảy ra khi
+            # seek trên codec nén), KHÔNG dồn frame — bỏ sleep, chạy tiếp
+            # ngay ở tốc độ decode thật thay vì cố đuổi kịp FPS gốc, để
+            # không tích luỹ hàng đợi .after() lớn dần theo thời gian.
             if sleep > 0:
                 _time.sleep(sleep)
 
     def _dy_scrub_seek(self, val):
-        """Scrub slider moved — pause và seek tới vị trí tương ứng."""
+        """Scrub slider moved — pause và seek tới vị trí tương ứng.
+        Chạy decode trên thread nền (không phải trực tiếp trong callback
+        của CTkSlider, vốn chạy trên GUI thread) — nếu người dùng kéo
+        thanh trượt nhanh/liên tục, mỗi lần kéo trước đây trigger 1 lần
+        seek+decode+resize ĐỒNG BỘ ngay trên GUI thread, dễ dồn ứ giống
+        hệt lỗi ở player loop. Đánh số thứ tự request để chỉ áp dụng kết
+        quả của request mới nhất, bỏ qua kết quả trễ của các request cũ
+        hơn khi user đã kéo tiếp."""
         if not self._player_cap:
             return
         self._player_paused = True
         self.dy_play_pause_btn.configure(text="▶")
         target = int(float(val) * (self._player_total - 1))
-        self._dy_player_show_frame(target)
+        self._scrub_req_seq = getattr(self, "_scrub_req_seq", 0) + 1
+        req_id = self._scrub_req_seq
+
+        def _bg():
+            pw, ph = _prev_dims(self._preview_video_w, self._preview_video_h, self._prev_box_w)
+            result = self._dy_decode_frame(target, pw, ph)
+            if result is None:
+                return
+            idx, img = result
+            if req_id != self._scrub_req_seq:
+                return  # user đã kéo tiếp, kết quả này đã cũ, bỏ qua
+            self.after(0, self._dy_apply_decoded_frame, idx, img)
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _dy_fullscreen_player(self):
         """Mở Toplevel fullscreen với canvas lớn — giống nút expand của CapCut.
-        Có thể thu nhỏ lại bằng phím Esc hoặc nút X."""
+        Có thể thu nhỏ lại bằng phím Esc hoặc nút X.
+
+        Fix 2026-07-15: trước đây _fs_loop (thread riêng cho fullscreen) và
+        _dy_player_loop (thread của player nhúng ở màn hình chính) có thể
+        chạy song song, cả 2 cùng gọi .set()/.read() trên chung 1 cv2.
+        VideoCapture không thread-safe → giật hình, đơ UI khi bấm nút mở
+        rộng. Fix: (1) dừng hẳn player nhúng trước khi mở fullscreen,
+        (2) mọi truy cập _player_cap đều qua self._player_lock,
+        (3) chỉ 1 fullscreen window tồn tại tại một thời điểm."""
         if not self._player_cap:
             # Fallback: mở bằng system player nếu chưa có video trong player
             vid = getattr(self, "_dy_downloaded_vid", None)
@@ -1485,11 +1763,33 @@ class App(ctk.CTk):
                 except Exception: pass
             return
 
+        # Nếu đã có cửa sổ fullscreen mở sẵn, chỉ đưa lên trên thay vì mở
+        # cửa sổ thứ hai (mở 2 cửa sổ cùng lúc là nguồn giật/lag khác).
+        if self._fs_win is not None and self._fs_win.winfo_exists():
+            self._fs_win.lift()
+            self._fs_win.focus_force()
+            return
+
+        # Dừng player nhúng ở màn hình chính — chỉ 1 loop được chạy tại
+        # một thời điểm, join để chắc chắn thread cũ đã thoát hẳn.
+        self._player_paused = True
+        if self._player_thread and self._player_thread.is_alive():
+            self._player_thread.join(timeout=1.0)
+        self.dy_play_pause_btn.configure(text="▶")
+
         win = tk.Toplevel(self)
+        self._fs_win = win
         win.title("DouyinViet — Video Player")
         win.configure(bg="#0f0f13")
         win.attributes("-fullscreen", True)
-        win.bind("<Escape>", lambda e: win.destroy())
+
+        def _fs_close():
+            self._player_paused = True
+            self._fs_win = None
+            win.destroy()
+
+        win.bind("<Escape>", lambda e: _fs_close())
+        win.protocol("WM_DELETE_WINDOW", _fs_close)
 
         scr_w = win.winfo_screenwidth()
         scr_h = win.winfo_screenheight()
@@ -1508,41 +1808,66 @@ class App(ctk.CTk):
         close_btn = ctk.CTkButton(win, text="✕ Đóng (Esc)", width=100, height=28,
                                    fg_color="#2a1a1a", hover_color="#5a2222",
                                    font=("Segoe UI", 10),
-                                   command=win.destroy)
+                                   command=_fs_close)
         close_btn.pack(pady=6)
 
-        # Mirror the player loop onto the fullscreen canvas
         fs_photo_ref = [None]
+        fs_thread = [None]
+
+        def _fs_apply(frame_idx, img):
+            """Việc NHẸ — chỉ tạo PhotoImage + vẽ. An toàn trên GUI thread."""
+            if self._fs_win is None:
+                return
+            from PIL import Image, ImageTk
+            # Composite overlay blur/sub — cùng cách với dy_canvas, để
+            # fullscreen cũng dùng canh vùng blur/sub được (trước đây
+            # chỉ hiện frame sạch, không overlay, trong cả fullscreen).
+            ov = self._dy_overlay_layer(cw, ch)
+            final = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+            photo = ImageTk.PhotoImage(final)
+            fs_canvas.delete("all")
+            fs_canvas.create_image(0, 0, anchor="nw", image=photo)
+            fs_photo_ref[0] = photo
+            self._player_pos = frame_idx
+            frac = frame_idx / max(1, self._player_total - 1)
+            fs_pos.set(frac)
+            self._player_pos_var.set(frac)
 
         def _fs_show(frame_idx):
-            if not self._player_cap:
+            """Dùng cho seek 1 lần (mở cửa sổ, scrub) — decode ở thread
+            nền rồi áp dụng, không block GUI thread."""
+            if self._fs_win is None or not self._player_cap:
                 return
-            try:
-                import cv2
-                from PIL import Image, ImageTk
-                self._player_cap.set(1, frame_idx)
-                ret, frame = self._player_cap.read()
-                if not ret: return
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(frame_rgb).resize((cw, ch), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                fs_canvas.delete("all")
-                fs_canvas.create_image(0, 0, anchor="nw", image=photo)
-                fs_photo_ref[0] = photo
-                self._player_pos = frame_idx
-            except Exception:
-                pass
+            def _bg():
+                result = self._dy_decode_frame(frame_idx, cw, ch)
+                if result is None or self._fs_win is None:
+                    return
+                idx, img = result
+                self._fs_win.after(0, _fs_apply, idx, img)
+            threading.Thread(target=_bg, daemon=True).start()
 
         def _fs_loop():
+            """Vòng lặp phát fullscreen trên thread NỀN — decode+resize
+            (việc nặng) chạy hết ở đây, chỉ đẩy ảnh xong lên GUI thread
+            qua _fs_apply (việc nhẹ). Cùng nguyên tắc + cùng fix giật
+            (seek=False, pos cục bộ) như _dy_player_loop — xem đó để
+            biết lý do."""
             import time as _t
             frame_ms = 1.0 / self._player_fps
-            while self._player_running and not self._player_paused:
+            pos = self._player_pos
+            while (self._fs_win is not None and self._player_running
+                   and not self._player_paused):
                 t0 = _t.perf_counter()
-                pos = self._player_pos + 1
+                pos += 1
                 if pos >= self._player_total:
                     self._player_paused = True
+                    if self._fs_win is not None:
+                        self._fs_win.after(0, lambda: fs_pp.configure(text="▶"))
                     break
-                win.after(0, _fs_show, pos)
+                result = self._dy_decode_frame(pos, cw, ch, seek=False)
+                if result is not None and self._fs_win is not None:
+                    idx, img = result
+                    self._fs_win.after(0, _fs_apply, idx, img)
                 elapsed = _t.perf_counter() - t0
                 s = frame_ms - elapsed
                 if s > 0: _t.sleep(s)
@@ -1556,7 +1881,9 @@ class App(ctk.CTk):
             if self._player_paused:
                 self._player_paused = False
                 fs_pp.configure(text="⏸")
-                threading.Thread(target=_fs_loop, daemon=True).start()
+                if not (fs_thread[0] and fs_thread[0].is_alive()):
+                    fs_thread[0] = threading.Thread(target=_fs_loop, daemon=True)
+                    fs_thread[0].start()
             else:
                 self._player_paused = True
                 fs_pp.configure(text="▶")
@@ -1572,7 +1899,7 @@ class App(ctk.CTk):
             self._player_paused = True
             fs_pp.configure(text="▶")
             target = int(float(val) * (self._player_total - 1))
-            win.after(0, _fs_show, target)
+            _fs_show(target)
 
         fs_sl = ctk.CTkSlider(ctrl, variable=fs_pos, from_=0, to=1,
                                height=18, progress_color=ACCENT2,
@@ -1584,7 +1911,13 @@ class App(ctk.CTk):
         _fs_show(self._player_pos)
 
     def _dy_play_video(self):
-        """Kích hoạt embedded player với video đã tải."""
+        """Nút ▶ lớn cạnh Preview. Trước đây luôn load lại player từ đầu
+        mỗi lần bấm — nếu player đã sẵn sàng (video đã load, ví dụ ngay
+        sau khi tải xong ở _dy_on_video_ready) thì bấm nút này chỉ hiện
+        lại frame đầu chứ không phát, khiến người dùng tưởng nút không
+        hoạt động. Fix: nếu player đã có cap sẵn cho đúng video này thì
+        toggle play/pause luôn; chỉ load lại khi chưa có player hoặc
+        player đang trỏ tới video khác."""
         vid = getattr(self, "_dy_downloaded_vid", None)
         if not vid or not Path(vid).exists():
             out_p = Path(self.dy_out.get())
@@ -1595,7 +1928,14 @@ class App(ctk.CTk):
                                     "Chưa tải video nào.\nBấm ⬇ Tải + SRT trước.")
                 return
             vid = cands[0]
-        self._dy_load_player(vid)
+
+        already_loaded = (self._player_cap is not None
+                           and str(getattr(self, "_player_video_path", "")) == str(vid))
+        if already_loaded:
+            self._dy_toggle_play()
+        else:
+            self._player_video_path = vid
+            self._dy_load_player(vid)
 
 
 
